@@ -17,11 +17,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract project ZIP
+      - name: Extract and find project
         run: |
-          unzip -q ENN-StoreManager_GitHubBuild.zip
-          cd ENN-StoreManager
-          test -f package.json
+          unzip -q ENN-StoreManager_GitHubBuild.zip -d extracted
+          PROJECT_DIR=$(find extracted -type f -name package.json -not -path '*/node_modules/*' -print -quit | xargs -r dirname)
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: package.json not found in ZIP"
+            find extracted -maxdepth 4 -type f | head -80
+            exit 1
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project found: $PROJECT_DIR"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -41,20 +47,22 @@ jobs:
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
 
       - name: Install and build
-        working-directory: ENN-StoreManager
         run: |
+          cd "$PROJECT_DIR"
           npm install
           npm run build
 
-      - name: Create Android project
-        working-directory: ENN-StoreManager
+      - name: Create and sync Android project
         run: |
-          npx cap add android
+          cd "$PROJECT_DIR"
+          if [ ! -d android ]; then
+            npx cap add android
+          fi
           npx cap sync android
 
       - name: Build APK
-        working-directory: ENN-StoreManager/android
         run: |
+          cd "$PROJECT_DIR/android"
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
 
@@ -62,5 +70,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ENN-StoreManager-debug-apk
-          path: ENN-StoreManager/android/app/build/outputs/apk/debug/app-debug.apk
+          path: ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

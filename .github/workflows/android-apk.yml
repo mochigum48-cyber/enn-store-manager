@@ -4,71 +4,130 @@ name: Build ENN Store Manager APK
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
 
 permissions:
   contents: read
 
 jobs:
   build:
+    name: Build Android APK
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Download repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 2. Extract project ZIP and find package.json
       - name: Extract and find project
+        shell: bash
         run: |
-          unzip -q ENN-StoreManager_GitHubBuild.zip -d extracted
-          PROJECT_DIR=$(find extracted -type f -name package.json -not -path '*/node_modules/*' -print -quit | xargs -r dirname)
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: package.json not found in ZIP"
-            find extracted -maxdepth 4 -type f | head -80
+          set -e
+
+          ZIP_FILE="ENN-StoreManager_GitHubBuild.zip"
+
+          if [ ! -f "$ZIP_FILE" ]; then
+            echo "ERROR: Project ZIP not found: $ZIP_FILE"
+            ls -la
             exit 1
           fi
+
+          mkdir -p extracted
+          unzip -q "$ZIP_FILE" -d extracted
+
+          PROJECT_DIR=$(find extracted \
+            -type f \
+            -name package.json \
+            -not -path '*/node_modules/*' \
+            -print -quit | xargs -r dirname)
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: package.json not found"
+            find extracted -maxdepth 4 -type f
+            exit 1
+          fi
+
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "Project found: $PROJECT_DIR"
 
+      # 3. Install Java
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
-      - name: Setup Node
+      # 4. Install Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: npm
+          cache-dependency-path: extracted/**/package-lock.json
 
+      # 5. Setup Android SDK
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
 
-      - name: Install Android SDK
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+      # 6. Install required Android packages
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager "platforms;android-35" \
+                     "build-tools;35.0.0" \
+                     "platform-tools"
 
-      - name: Install and build
+      # 7. Install project dependencies
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      # 8. Build web project
+      - name: Build web app
         run: |
           cd "$PROJECT_DIR"
-          npm install
           npm run build
 
-      - name: Create and sync Android project
+      # 9. Create Android project if missing
+      - name: Create Android project
         run: |
           cd "$PROJECT_DIR"
+
           if [ ! -d android ]; then
             npx cap add android
           fi
+
+      # 10. Sync Capacitor
+      - name: Sync Android project
+        run: |
+          cd "$PROJECT_DIR"
           npx cap sync android
 
-      - name: Build APK
+      # 11. Build APK
+      - name: Build Debug APK
         run: |
           cd "$PROJECT_DIR/android"
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
 
+      # 12. Upload APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ENN-StoreManager-debug-apk
+          name: ENN-StoreManager-APK
           path: ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 14

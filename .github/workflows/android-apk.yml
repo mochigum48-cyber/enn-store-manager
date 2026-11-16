@@ -1,131 +1,153 @@
-
 name: Build ENN Store Manager APK
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  build-apk:
     name: Build Android APK
     runs-on: ubuntu-latest
-
     steps:
-      # 1. Get repository files
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Extract ZIP and locate project
-      - name: Extract and find project
+      # The repository stores the application source inside a ZIP archive.
+      # Extract it and locate the single package.json without writing a
+      # multiline value to GITHUB_ENV.
+      - name: Extract and locate project
+        id: project
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import zipfile
+          from pathlib import Path
 
-          ZIP_FILE="ENN-StoreManager_GitHubBuild.zip"
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          archives = [p for p in root.glob("*.zip") if p.is_file()]
+          if not archives:
+              raise SystemExit("ERROR: No project ZIP found in repository root.")
 
-          if [ ! -f "$ZIP_FILE" ]; then
-            echo "ERROR: Project ZIP not found: $ZIP_FILE"
-            ls -la
-            exit 1
-          fi
+          # Prefer the archive that contains package.json; ignore unrelated ZIPs.
+          candidates = []
+          for archive in archives:
+              try:
+                  with zipfile.ZipFile(archive) as zf:
+                      matches = [n for n in zf.namelist()
+                                 if n.endswith("package.json")
+                                 and "node_modules/" not in n]
+                      if matches:
+                          candidates.append((archive, matches))
+              except zipfile.BadZipFile:
+                  continue
 
-          mkdir -p extracted
-          unzip -q "$ZIP_FILE" -d extracted
+          if len(candidates) != 1:
+              names = ", ".join(str(x[0].name) for x in candidates) or "none"
+              raise SystemExit(
+                  f"ERROR: Expected exactly one project ZIP containing package.json; found: {names}"
+              )
 
-          PROJECT_DIR=$(find extracted \
-            -type f \
-            -name package.json \
-            -not -path '*/node_modules/*' \
-            -print -quit | xargs -r dirname)
+          archive, matches = candidates[0]
+          if len(matches) != 1:
+              raise SystemExit(
+                  f"ERROR: {archive.name} contains multiple package.json files; please upload one clean project ZIP."
+              )
 
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: package.json not found in ZIP"
-            find extracted -maxdepth 5 -type f
-            exit 1
-          fi
+          destination = root / "_build_source"
+          destination.mkdir(exist_ok=True)
+          with zipfile.ZipFile(archive) as zf:
+              zf.extractall(destination)
 
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Project found: $PROJECT_DIR"
+          package_file = destination / matches[0]
+          project_dir = package_file.parent.resolve()
+          if not (project_dir / "capacitor.config.json").exists():
+              raise SystemExit("ERROR: capacitor.config.json not found beside package.json.")
 
-      # 3. Setup Java
-      - name: Setup Java
+          with (project_dir / "package.json").open(encoding="utf-8") as f:
+              import json
+              package = json.load(f)
+          if not package.get("scripts", {}).get("build"):
+              raise SystemExit("ERROR: package.json has no build script.")
+
+          output = os.environ["GITHUB_OUTPUT"]
+          with open(output, "a", encoding="utf-8") as f:
+              f.write(f"project_dir={project_dir}\n")
+          print(f"Project archive: {archive.name}")
+          print(f"Project directory: {project_dir}")
+          PY
+
+      - name: Set up Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
-      # 4. Setup Node.js (cache disabled)
-      - name: Setup Node.js
+      - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      # 5. Setup Android SDK
-      - name: Setup Android SDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v4
-        with:
-          packages: platform-tools
-          accept-android-sdk-licenses: true
-          log-accepted-android-sdk-licenses: false
 
-      # 6. Install Android SDK packages
       - name: Install Android SDK packages
-        run: |
-          sdkmanager "platforms;android-35" \
-                     "build-tools;35.0.0" \
-                     "platform-tools"
-
-      # 7. Install project dependencies
-      - name: Install dependencies
         shell: bash
         run: |
-          set -e
-          cd "$PROJECT_DIR"
+          set -euo pipefail
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
-
-      # 8. Build web application
-      - name: Build web app
+      - name: Install dependencies
+        working-directory: ${{ steps.project.outputs.project_dir }}
         run: |
-          cd "$PROJECT_DIR"
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+
+      - name: Build web app and verify pages and music
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
           npm run build
+          for page in index.html sales.html products.html purchases.html debts.html expenses.html reports.html setup.html; do
+            test -f "dist/$page" || { echo "Missing built page: dist/$page"; exit 1; }
+          done
+          for track in music1.mp3 music2.mp3; do
+            test -f "dist/assets/music/$track" || { echo "Missing music: dist/assets/music/$track"; exit 1; }
+          done
 
-      # 9. Create Android project
-      - name: Create Android project
+      - name: Create Android project if needed
+        working-directory: ${{ steps.project.outputs.project_dir }}
         run: |
-          cd "$PROJECT_DIR"
+          if [ ! -d android ]; then npx cap add android; fi
 
-          if [ ! -d android ]; then
-            npx cap add android
-          fi
+      - name: Sync Capacitor
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        run: npx cap sync android
 
-      # 10. Sync Capacitor
-      - name: Sync Android project
+      - name: Apply app icons
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
         run: |
-          cd "$PROJECT_DIR"
-          npx cap sync android
+          set -euo pipefail
+          test -d android-res || { echo "android-res folder is missing"; exit 1; }
+          mkdir -p android/app/src/main/res
+          cp -R android-res/. android/app/src/main/res/
 
-      # 11. Build APK
-      - name: Build Debug APK
+      - name: Build debug APK
+        working-directory: ${{ steps.project.outputs.project_dir }}/android
         run: |
-          cd "$PROJECT_DIR/android"
-          chmod +x gradlew
+          chmod +x ./gradlew
           ./gradlew assembleDebug --no-daemon
 
-      # 12. Upload APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ENN-StoreManager-APK
-          path: ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/debug/app-debug.apk
+          name: ENN-StoreManager-debug-apk
+          path: ${{ steps.project.outputs.project_dir }}/android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14

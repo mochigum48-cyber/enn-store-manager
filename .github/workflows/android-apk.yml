@@ -1,90 +1,131 @@
+
 name: Build ENN Store Manager APK
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
 
 jobs:
-  build-apk:
-    name: Build Android APK (Expo)
+  build-android:
+    name: Build Android Release APK
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Set up Java
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK packages
-        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+      - name: Install Android SDK
+        run: |
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
 
-      - name: Extract Expo project
+      - name: Extract Expo Project
         shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           import zipfile
+          import json
           from pathlib import Path
 
           root = Path.cwd()
-          archives = list(root.glob("*.zip"))
-          if len(archives) != 1:
-              raise SystemExit(f"Expected exactly one project ZIP in repository root; found {len(archives)}")
           dest = root / "_build_source"
           dest.mkdir(exist_ok=True)
+
+          archives = list(root.glob("*.zip"))
+
+          if len(archives) != 1:
+              raise SystemExit(
+                  f"Expected exactly one project ZIP, found {len(archives)}"
+              )
+
           with zipfile.ZipFile(archives[0]) as z:
               z.extractall(dest)
-          candidates = list(dest.rglob("package.json"))
-          candidates = [p for p in candidates if "node_modules" not in p.parts]
-          if len(candidates) != 1:
-              raise SystemExit(f"Expected one package.json in project ZIP; found {len(candidates)}")
-          project = candidates[0].parent
+
+          packages = [
+              p for p in dest.rglob("package.json")
+              if "node_modules" not in p.parts
+          ]
+
+          if len(packages) != 1:
+              raise SystemExit(
+                  f"Expected one package.json, found {len(packages)}"
+              )
+
+          project = packages[0].parent
+
           if not (project / "app.json").exists():
-              raise SystemExit("Expo app.json not found beside package.json")
-          import json
-          pkg = json.loads((project / "package.json").read_text())
-          if "expo" not in pkg.get("dependencies", {}):
-              raise SystemExit("This project is not configured as an Expo app")
-          print(f"Expo project located at: {project}")
-          (root / "project-dir.txt").write_text(str(project.resolve()))
+              raise SystemExit("Expo app.json not found")
+
+          package = json.loads(
+              packages[0].read_text(encoding="utf-8")
+          )
+
+          if "expo" not in package.get("dependencies", {}):
+              raise SystemExit("Expo dependency not found")
+
+          print("Expo project:", project)
+
+          with open("project-dir.txt", "w") as f:
+              f.write(str(project.resolve()))
           PY
+
           echo "PROJECT_DIR=$(cat project-dir.txt)" >> "$GITHUB_ENV"
 
-      - name: Install JavaScript dependencies
+      - name: Install Dependencies
         working-directory: ${{ env.PROJECT_DIR }}
         run: npm install --no-audit --no-fund
 
-      - name: Generate native Android project
+      - name: Generate Android Project
         working-directory: ${{ env.PROJECT_DIR }}
         run: npx expo prebuild --platform android --clean --no-install
 
-      - name: Build debug APK
+      - name: Build Release APK
         working-directory: ${{ env.PROJECT_DIR }}/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Verify APK
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x ./gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+
+          APK="android/app/build/outputs/apk/release/app-release.apk"
+
+          test -s "$APK"
+
+          unzip -t "$APK"
+
+          unzip -l "$APK" | grep "assets/index.android.bundle"
+
+          echo "APK and JavaScript Bundle verification passed."
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ENN-StoreManager-debug-apk
-          path: _build_source/ENN-StoreManager-Full/android/app/build/outputs/apk/debug/app-debug.apk
+          name: ENN-StoreManager-release-apk
+          path: ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 14
